@@ -4,6 +4,9 @@
 #include <wayfire/render-manager.hpp>
 #include <wayfire/util/duration.hpp>
 
+#include <fstream>
+#include <algorithm>
+
 class wayfire_zoom_screen : public wf::per_output_plugin_instance_t
 {
     enum class interpolation_method_t
@@ -35,7 +38,7 @@ class wayfire_zoom_screen : public wf::per_output_plugin_instance_t
     {
         float target = progression.end;
         target -= target * delta * speed;
-        target  = wf::clamp(target, 1.0f, 50.0f);
+        target = wf::clamp(target, 1.0f, 50.0f);
 
         if (target != progression.end)
         {
@@ -72,6 +75,7 @@ class wayfire_zoom_screen : public wf::per_output_plugin_instance_t
     {
         auto w = destination.get_size().width;
         auto h = destination.get_size().height;
+
         if ((w <= 0) || (h <= 0))
         {
             LOGE("Invalid output size in zoom plugin!");
@@ -79,6 +83,7 @@ class wayfire_zoom_screen : public wf::per_output_plugin_instance_t
         }
 
         auto oc = output->get_cursor_position();
+
         double x, y;
         wlr_box b = wf::to_integer_box(output->get_relative_geometry());
         wlr_box_closest_point(&b, oc.x, oc.y, &x, &y);
@@ -86,20 +91,75 @@ class wayfire_zoom_screen : public wf::per_output_plugin_instance_t
         /* get rotation & scale */
         wf::geometry_t box = {x, y, 1, 1};
         box = output->render->get_target_framebuffer().framebuffer_geometry_from_geometry_box(box);
-        x   = box.x;
-        y   = box.y;
+        x = box.x;
+        y = box.y;
 
-        // Store progression once to avoid its value changing in subsequent calls, could be very tricky due to
-        // timing. And if we use slightly different progressions, we can get an invalid rect.
         const float factor = (float)progression;
-        const float scale  = (factor - 1) / factor;
-        const float x1     = std::clamp(float(x * scale), 0.0f, w - 1.0f);
-        const float y1     = std::clamp(float(y * scale), 0.0f, h - 1.0f);
-        const float tw     = std::clamp(w / factor, 0.0f, w - x1);
-        const float th     = std::clamp(h / factor, 0.0f, h - y1);
-        auto filter_mode   = (interpolation_method == (int)interpolation_method_t::NEAREST) ?
-            WLR_SCALE_FILTER_NEAREST : WLR_SCALE_FILTER_BILINEAR;
-        destination.blit(source, {x1, y1, tw, th}, {0.0, 0.0, (double)w, (double)h}, filter_mode);
+
+        /*
+         * Source rectangle centered around the cursor.
+         *
+         * The cursor is at the center of the destination, so the
+         * source point corresponding to the cursor is also at (x, y).
+         */
+        const float tw = w / factor;
+        const float th = h / factor;
+
+        const float x1 = x - tw / 2.0f;
+        const float y1 = y - th / 2.0f;
+
+        /*
+         * wlroots requires the source rectangle to stay inside
+         * the texture, so clip it.
+         */
+        const float sx1 = std::max(x1, 0.0f);
+        const float sy1 = std::max(y1, 0.0f);
+        const float sx2 = std::min(x1 + tw, (float)w);
+        const float sy2 = std::min(y1 + th, (float)h);
+
+        const float sw = sx2 - sx1;
+        const float sh = sy2 - sy1;
+
+        auto filter_mode =
+            (interpolation_method == (int)interpolation_method_t::NEAREST) ?
+            WLR_SCALE_FILTER_NEAREST :
+            WLR_SCALE_FILTER_BILINEAR;
+
+        std::ofstream log("/tmp/wayfire-zoom.log", std::ios::app);
+
+        log << "x=" << x
+            << " y=" << y
+            << " factor=" << factor
+            << " requested_src=("
+            << x1 << "," << y1 << "," << tw << "," << th
+            << ") clipped_src=("
+            << sx1 << "," << sy1 << "," << sw << "," << sh
+            << ")";
+
+        if (sw > 0.0f && sh > 0.0f)
+        {
+            /*
+             * Map the clipped source rectangle back to the
+             * corresponding destination position.
+             */
+            const float dx = (sx1 - x1) * factor;
+            const float dy = (sy1 - y1) * factor;
+            const float dw = sw * factor;
+            const float dh = sh * factor;
+
+            log << " dst=("
+                << dx << "," << dy << "," << dw << "," << dh
+                << ")";
+
+            destination.blit(
+                source,
+                {sx1, sy1, sw, sh},
+                {dx, dy, dw, dh},
+                filter_mode);
+        }
+
+        log << '\n';
+
         if (!progression.running() && (progression - 1 <= 0.01))
         {
             unset_hook();
